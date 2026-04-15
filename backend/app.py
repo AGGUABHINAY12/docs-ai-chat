@@ -1,219 +1,344 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import os
-import uuid
-import shutil
+import streamlit as st
+import PyPDF2
 import re
-from datetime import datetime, timedelta
-from typing import Optional
+import uuid
+from datetime import datetime
+import os
 
-# Try to import PDF library
-try:
-    from PyPDF2 import PdfReader
-    PDF_OK = True
-except:
-    PDF_OK = False
-    print("⚠️ PyPDF2 not installed. PDF support limited.")
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# ========== PAGE CONFIGURATION ==========
+st.set_page_config(
+    page_title="DocuAIChat - AI Document Assistant",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Storage
-documents = {}
-sessions = {}
+# ========== CUSTOM CSS FOR BETTER UI ==========
+st.markdown("""
+<style>
+    /* Main container */
+    .main {
+        background: linear-gradient(135deg, #0f0f12 0%, #1a1a2e 100%);
+    }
+    
+    /* Chat messages */
+    .user-message {
+        background: linear-gradient(135deg, #4f46e5, #7c3aed);
+        color: white;
+        padding: 12px 18px;
+        border-radius: 20px;
+        margin: 10px 0;
+        max-width: 70%;
+        float: right;
+        clear: both;
+    }
+    
+    .ai-message {
+        background: rgba(30, 41, 59, 0.9);
+        color: #e2e8f0;
+        padding: 12px 18px;
+        border-radius: 20px;
+        margin: 10px 0;
+        max-width: 70%;
+        float: left;
+        clear: both;
+        border: 1px solid rgba(255,255,255,0.1);
+    }
+    
+    /* Sidebar styling */
+    .css-1d391kg {
+        background: rgba(15, 23, 42, 0.95);
+    }
+    
+    /* Upload button */
+    .upload-btn {
+        background: linear-gradient(135deg, #4f46e5, #7c3aed);
+        color: white;
+        padding: 10px 20px;
+        border-radius: 30px;
+        text-align: center;
+    }
+    
+    /* Title */
+    h1 {
+        background: linear-gradient(135deg, #818cf8, #c084fc);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ========== SESSION STATE INITIALIZATION ==========
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'document_content' not in st.session_state:
+    st.session_state.document_content = ""
+if 'document_name' not in st.session_state:
+    st.session_state.document_name = None
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'user_email' not in st.session_state:
+    st.session_state.user_email = None
+
+# ========== SIMPLE USER DATABASE (In-memory) ==========
 users = {
-    "demo@smartprep.com": {"password": "demo123", "name": "Demo User"},
+    "demo@docuai.com": {"password": "demo123", "name": "Demo User"},
+    "test@docuai.com": {"password": "test123", "name": "Test User"}
 }
-active_tokens = {}
 
-# Helper: Extract sentences from text
-def extract_sentences(text):
-    # Split by periods, question marks, exclamation marks
-    sentences = re.split(r'[.!?]+', text)
-    # Clean up
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-    return sentences
+# ========== HELPER FUNCTIONS ==========
+def extract_text_from_pdf(file):
+    """Extract text from uploaded PDF"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        return f"Error reading PDF: {str(e)}"
 
-# Helper: Find relevant sentences based on query
-def find_relevant_sentences(query, document_content, max_sentences=3):
+def clean_sentence(sentence):
+    """Clean sentence from author names and extra spaces"""
+    authors_to_remove = ['Chandrashekhar Goswami', 'C. Goswami', 'Goswami']
+    for author in authors_to_remove:
+        if sentence.endswith(author):
+            sentence = sentence[:-len(author)].strip()
+        if sentence.startswith(author):
+            sentence = sentence[len(author):].strip()
+    sentence = ' '.join(sentence.split())
+    if sentence and not sentence.endswith(('.', '!', '?')):
+        sentence += '.'
+    return sentence
+
+def get_best_answer(query, document_content):
+    """Extract best answer from document based on query keywords"""
     if not document_content:
-        return []
+        return None
     
     query_words = set(query.lower().split())
-    # Remove common stop words
-    stop_words = {'what', 'is', 'are', 'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'with', 'by', 'at', 'from', 'up', 'down', 'and', 'or', 'so', 'but', 'if', 'then', 'else', 'when', 'where', 'which', 'while', 'this', 'that', 'these', 'those', 'it', 'they', 'we', 'you', 'he', 'she', 'me', 'him', 'her', 'us', 'them'}
+    stop_words = {'what', 'is', 'are', 'the', 'a', 'an', 'of', 'to', 'in', 
+                  'for', 'on', 'with', 'by', 'at', 'from', 'up', 'down', 'and', 
+                  'or', 'so', 'but', 'if', 'then', 'else', 'when', 'where', 
+                  'which', 'while', 'this', 'that', 'these', 'those', 'it', 
+                  'they', 'we', 'you', 'he', 'she', 'me', 'him', 'her', 'us', 'them'}
+    
     query_keywords = [w for w in query_words if w not in stop_words and len(w) > 2]
     
-    sentences = extract_sentences(document_content)
-    if not sentences:
-        return []
+    # Split into sentences
+    sentences = re.split(r'[.!?]+', document_content)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
     
-    # Score each sentence by keyword matches
+    if not sentences:
+        return None
+    
+    # Score sentences by keyword matches
     scored = []
     for sent in sentences:
         sent_lower = sent.lower()
         score = sum(1 for kw in query_keywords if kw in sent_lower)
-        # Also give partial credit for word overlaps
         if score > 0:
             scored.append((score, sent))
     
-    # Sort by score descending
-    scored.sort(key=lambda x: x[0], reverse=True)
+    if not scored:
+        return clean_sentence(sentences[0])
     
-    # Return top matches
-    return [sent for _, sent in scored[:max_sentences]]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return clean_sentence(scored[0][1])
 
-@app.post("/api/auth/login")
-async def login(request: dict):
-    email = request.get("email", "").strip().lower()
-    password = request.get("password", "")
-    if email in users and users[email]["password"] == password:
-        token = str(uuid.uuid4())
-        expiry = datetime.now() + timedelta(days=7)
-        active_tokens[token] = expiry
-        return {"success": True, "token": token, "user": {"email": email, "name": users[email]["name"]}}
-    return {"success": False, "error": "Invalid email or password"}
+def get_ai_response(message, doc_content, doc_name):
+    """Generate AI response based on message and document"""
+    msg_lower = message.lower()
+    
+    # Greeting
+    if any(word in msg_lower for word in ['hello', 'hi', 'hey']):
+        return "👋 Hello! I'm DocuAIChat. Upload a PDF document and ask me anything about it!"
+    
+    # No document uploaded
+    if not doc_content:
+        return "📚 Please upload a PDF document first. I can then answer questions, summarize, and explain concepts from your document."
+    
+    # Document-based questions
+    answer = get_best_answer(message, doc_content)
+    
+    if answer:
+        return answer
+    else:
+        preview = doc_content[:300].split('.')[0] + "."
+        return f"I couldn't find a direct answer. Here's a related excerpt from '{doc_name}':\n\n{preview}"
 
-@app.post("/api/auth/register")
-async def register(request: dict):
-    email = request.get("email", "").strip().lower()
-    password = request.get("password", "")
-    name = request.get("name", "")
-    if not email or not password:
-        return {"success": False, "error": "Email and password required"}
-    if email in users:
-        return {"success": False, "error": "Email already exists"}
-    users[email] = {"password": password, "name": name or email.split('@')[0]}
-    token = str(uuid.uuid4())
-    expiry = datetime.now() + timedelta(days=7)
-    active_tokens[token] = expiry
-    return {"success": True, "token": token, "user": {"email": email, "name": users[email]["name"]}}
+# ========== LOGIN PAGE ==========
+def login_page():
+    st.markdown("""
+    <div style="text-align: center; padding: 60px 20px;">
+        <h1 style="font-size: 64px; margin-bottom: 20px;">📄 DocuAIChat</h1>
+        <p style="font-size: 18px; color: #94a3b8;">AI-Powered Document Q&A Assistant</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        tab1, tab2 = st.tabs(["🔐 Login", "📝 Register"])
+        
+        with tab1:
+            with st.form("login_form"):
+                email = st.text_input("Email", placeholder="demo@docuai.com")
+                password = st.text_input("Password", type="password", placeholder="demo123")
+                submitted = st.form_submit_button("Login", use_container_width=True)
+                
+                if submitted:
+                    if email in users and users[email]["password"] == password:
+                        st.session_state.authenticated = True
+                        st.session_state.user_email = email
+                        st.rerun()
+                    else:
+                        st.error("Invalid email or password. Try: demo@docuai.com / demo123")
+        
+        with tab2:
+            with st.form("register_form"):
+                name = st.text_input("Full Name", placeholder="John Doe")
+                email = st.text_input("Email", placeholder="your@email.com")
+                password = st.text_input("Password", type="password", placeholder="Create password")
+                submitted = st.form_submit_button("Register", use_container_width=True)
+                
+                if submitted:
+                    if email in users:
+                        st.error("Email already exists!")
+                    elif email and password:
+                        users[email] = {"password": password, "name": name or email.split('@')[0]}
+                        st.success("Registration successful! Please login.")
+                    else:
+                        st.error("Please fill all fields")
 
-@app.post("/api/auth/logout")
-async def logout(request: dict):
-    token = request.get("token", "")
-    if token in active_tokens:
-        del active_tokens[token]
-    return {"success": True}
-
-@app.get("/api/health")
-async def health_check():
-    return {"status": "OK"}
-
-@app.post("/api/documents/upload")
-async def upload_document(file: UploadFile = File(...)):
-    try:
-        doc_id = str(uuid.uuid4())
-        file_ext = os.path.splitext(file.filename)[1].lower()
-        os.makedirs("uploads", exist_ok=True)
-        file_path = f"uploads/{doc_id}{file_ext}"
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+# ========== MAIN CHAT INTERFACE ==========
+def main_chat():
+    # Sidebar
+    with st.sidebar:
+        st.markdown("### 📄 DocuAIChat")
+        st.markdown("---")
         
-        content = ""
-        if file_ext == '.pdf' and PDF_OK:
-            try:
-                reader = PdfReader(file_path)
-                for page in reader.pages:
-                    text = page.extract_text()
-                    if text:
-                        content += text + "\n"
-            except Exception as e:
-                content = f"Error reading PDF: {str(e)}"
-        elif file_ext == '.txt':
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        else:
-            content = f"[{file_ext} file uploaded: {file.filename}]"
+        # User info
+        st.markdown(f"""
+        <div style="background: rgba(255,255,255,0.05); padding: 15px; border-radius: 12px; margin-bottom: 20px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <div style="width: 40px; height: 40px; background: linear-gradient(135deg, #4f46e5, #7c3aed); border-radius: 50%; display: flex; align-items: center; justify-content: center;">
+                    <span style="color: white;">👤</span>
+                </div>
+                <div>
+                    <div style="font-weight: 600;">{users[st.session_state.user_email]['name']}</div>
+                    <div style="font-size: 11px; color: #94a3b8;">{st.session_state.user_email}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # Store full content (up to 15000 chars for performance)
-        documents[doc_id] = {
-            "id": doc_id,
-            "name": file.filename,
-            "content": content[:15000],
-            "type": file_ext
-        }
+        # Document Upload Section
+        st.markdown("### 📁 Document")
+        uploaded_file = st.file_uploader("Upload PDF", type=['pdf'], label_visibility="collapsed")
         
-        return {
-            "success": True,
-            "document_id": doc_id,
-            "file_name": file.filename,
-            "content": content[:15000],  # Return full content to frontend
-            "content_length": len(content)
-        }
-    except Exception as e:
-        print(f"Upload error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/chat/send")
-async def send_message(request: dict):
-    try:
-        message = request.get("message", "")
-        doc_content = request.get("document_content", "")
-        doc_name = request.get("file_name", "")
-        session_id = request.get("session_id", str(uuid.uuid4()))
+        if uploaded_file is not None:
+            with st.spinner("Processing document..."):
+                text = extract_text_from_pdf(uploaded_file)
+                if text and len(text) > 100:
+                    st.session_state.document_content = text[:15000]
+                    st.session_state.document_name = uploaded_file.name
+                    st.success(f"✅ {uploaded_file.name}")
+                    st.info(f"📊 {len(text)} characters extracted")
+                else:
+                    st.error("Could not extract text. Try another PDF.")
         
-        msg_lower = message.lower()
-        has_doc = bool(doc_content and len(doc_content) > 100)
+        # Document status
+        if st.session_state.document_name:
+            st.markdown(f"""
+            <div style="background: rgba(79, 70, 229, 0.15); padding: 10px; border-radius: 10px; margin-top: 10px;">
+                <small>📄 Active: <strong>{st.session_state.document_name[:30]}</strong></small>
+            </div>
+            """, unsafe_allow_html=True)
         
-        # Greeting
-        if any(word in msg_lower for word in ['hello', 'hi', 'hey', 'greetings']):
-            response = "👋 Hello! I'm SmartPrep AI. Upload a PDF and ask me questions about it. I'll find relevant information from your document."
+        st.markdown("---")
         
-        elif not has_doc:
-            response = "📚 Please upload a PDF document first. I can then answer questions, summarize, and explain concepts from your document."
+        # Clear chat button
+        if st.button("🗑️ Clear Chat", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
         
-        else:
-            # Find relevant sentences from document content
-            relevant_sents = find_relevant_sentences(message, doc_content, max_sentences=4)
-            
-            if relevant_sents:
-                # Build response from relevant sentences
-                answer = "\n\n".join([f"• {s}" for s in relevant_sents])
-                response = f"📖 **Based on your document '{doc_name}':**\n\n{answer}\n\n💡 Is there anything specific you'd like me to clarify?"
+        # Logout button
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.messages = []
+            st.session_state.document_content = ""
+            st.session_state.document_name = None
+            st.rerun()
+        
+        st.markdown("---")
+        st.caption("💡 **Tips:**\n• Ask questions like 'What is X?'\n• 'Summarize this document'\n• 'Explain the key points'")
+    
+    # Main Chat Area
+    st.markdown("""
+    <div style="text-align: center; padding: 20px 0;">
+        <h1>📄 DocuAIChat</h1>
+        <p style="color: #94a3b8;">Ask questions about your document and get instant answers</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Chat history display
+    chat_container = st.container()
+    
+    with chat_container:
+        for msg in st.session_state.messages:
+            if msg["role"] == "user":
+                st.markdown(f"""
+                <div style="display: flex; justify-content: flex-end; margin: 10px 0;">
+                    <div style="background: linear-gradient(135deg, #4f46e5, #7c3aed); color: white; padding: 12px 18px; border-radius: 20px; max-width: 70%;">
+                        {msg["content"]}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
             else:
-                # Fallback: give a preview of the document and ask for more specific question
-                preview = doc_content[:400]
-                response = f"📄 I couldn't find a direct answer to your question in the document. Here's a preview of the content:\n\n{preview}...\n\nCould you rephrase your question or ask about a specific topic mentioned?"
+                st.markdown(f"""
+                <div style="display: flex; justify-content: flex-start; margin: 10px 0;">
+                    <div style="background: rgba(30, 41, 59, 0.9); color: #e2e8f0; padding: 12px 18px; border-radius: 20px; max-width: 70%; border: 1px solid rgba(255,255,255,0.05);">
+                        <strong>🤖 DocuAI:</strong><br>{msg["content"]}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+    
+    # Chat input
+    st.markdown("---")
+    
+    col1, col2 = st.columns([5, 1])
+    
+    with col1:
+        user_input = st.text_input("Ask a question about your document...", key="user_input", label_visibility="collapsed", placeholder="Type your question here...")
+    
+    with col2:
+        send_button = st.button("Send 📤", use_container_width=True)
+    
+    if send_button and user_input:
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": user_input})
         
-        # Store in session
-        if session_id not in sessions:
-            sessions[session_id] = []
-        sessions[session_id].append({"role": "user", "content": message})
-        sessions[session_id].append({"role": "assistant", "content": response})
+        # Generate response
+        with st.spinner("🤔 Thinking..."):
+            response = get_ai_response(
+                user_input,
+                st.session_state.document_content,
+                st.session_state.document_name
+            )
         
-        return {
-            "response": response,
-            "session_id": session_id,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        print(f"Chat error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Add AI response
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # Rerun to update chat display
+        st.rerun()
 
-@app.get("/api/chat/history/{session_id}")
-async def get_history(session_id: str):
-    if session_id in sessions:
-        return {"history": sessions[session_id], "session_id": session_id}
-    return {"history": [], "session_id": session_id}
-
-@app.delete("/api/chat/history/{session_id}")
-async def clear_history(session_id: str):
-    if session_id in sessions:
-        sessions[session_id] = []
-    return {"message": "History cleared"}
+# ========== APP ROUTING ==========
+def main():
+    if not st.session_state.authenticated:
+        login_page()
+    else:
+        main_chat()
 
 if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("🚀 SmartPrep AI Server Starting...")
-    print("📍 http://localhost:8000")
-    print("="*50 + "\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    main()
